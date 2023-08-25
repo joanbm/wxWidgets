@@ -439,6 +439,18 @@ static const struct wl_callback_listener wl_frame_listener = {
     wl_frame_callback_handler
 };
 
+static gboolean gtk_glcanvas_map_callback(GtkWidget *, GdkEventAny *, wxGLCanvasEGL *win)
+{
+    win->CreateWaylandEGLWindow();
+    return FALSE;
+}
+
+static gboolean gtk_glcanvas_unmap_callback(GtkWidget *, GdkEventAny *, wxGLCanvasEGL *win)
+{
+    win->DestroyWaylandEGLWindow();
+    return FALSE;
+}
+
 static void gtk_glcanvas_size_callback(GtkWidget *widget,
                                        GtkAllocation *,
                                        wxGLCanvasEGL *win)
@@ -475,15 +487,18 @@ bool wxGLCanvasEGL::CreateSurface()
         m_xwindow = GDK_WINDOW_XID(window);
         m_surface = eglCreatePlatformWindowSurface(m_display, *m_config,
                                                    &m_xwindow, nullptr);
+
+        if ( m_surface == EGL_NO_SURFACE )
+        {
+            wxFAIL_MSG("Unable to create EGL surface");
+            return false;
+        }
     }
 #endif
 #ifdef GDK_WINDOWING_WAYLAND
     if (wxGTKImpl::IsWayland(window))
     {
-        int w = gdk_window_get_width(window);
-        int h = gdk_window_get_height(window);
         struct wl_display *display = gdk_wayland_display_get_wl_display(gdk_window_get_display(window));
-        struct wl_surface *surface = gdk_wayland_window_get_wl_surface(window);
         struct wl_registry *registry = wl_display_get_registry(display);
         wl_registry_add_listener(registry, &wl_registry_listener, this);
         wl_display_roundtrip(display);
@@ -494,21 +509,17 @@ bool wxGLCanvasEGL::CreateSurface()
         }
         m_wlSurface = wl_compositor_create_surface(m_wlCompositor);
         m_wlRegion = wl_compositor_create_region(m_wlCompositor);
-        m_wlSubsurface = wl_subcompositor_get_subsurface(m_wlSubcompositor,
-                                                         m_wlSurface,
-                                                         surface);
         wl_surface_set_input_region(m_wlSurface, m_wlRegion);
-        wl_subsurface_set_desync(m_wlSubsurface);
-        wxEGLUpdatePosition(this);
-        int scale = gdk_window_get_scale_factor(window);
-        wl_surface_set_buffer_scale(m_wlSurface, scale);
-        m_wlEGLWindow = wl_egl_window_create(m_wlSurface, w * scale,
-                                             h * scale);
-        m_surface = eglCreatePlatformWindowSurface(m_display, *m_config,
-                                                   m_wlEGLWindow, nullptr);
-        m_wlFrameCallbackHandler = wl_surface_frame(surface);
-        wl_callback_add_listener(m_wlFrameCallbackHandler,
-                                 &wl_frame_listener, this);
+
+        gtk_widget_add_events(m_widget, GDK_STRUCTURE_MASK);
+        // We need to use "map-event" instead of "map" to ensure that the
+        // widget's underlying Wayland surface has been created.
+        // Otherwise, gdk_wayland_window_get_wl_surface may return nullptr,
+        // for example when hiding then showing a window containing a canvas.
+        g_signal_connect(m_widget, "map-event",
+                         G_CALLBACK(gtk_glcanvas_map_callback), this);
+        g_signal_connect(m_widget, "unmap-event",
+                         G_CALLBACK(gtk_glcanvas_unmap_callback), this);
         g_signal_connect(m_widget, "size-allocate",
                          G_CALLBACK(gtk_glcanvas_size_callback), this);
 
@@ -518,12 +529,6 @@ bool wxGLCanvasEGL::CreateSurface()
     }
 #endif
 
-    if ( m_surface == EGL_NO_SURFACE )
-    {
-        wxFAIL_MSG("Unable to create EGL surface");
-        return false;
-    }
-
     return true;
 }
 
@@ -531,13 +536,57 @@ wxGLCanvasEGL::~wxGLCanvasEGL()
 {
     if ( m_config && m_config != ms_glEGLConfig )
         delete m_config;
+#ifdef GDK_WINDOWING_WAYLAND
+    DestroyWaylandEGLWindow();
+    g_clear_pointer(&m_wlSurface, wl_surface_destroy);
+#endif
     if ( m_surface )
         eglDestroySurface(m_display, m_surface);
+}
+
+void wxGLCanvasEGL::CreateWaylandEGLWindow()
+{
 #ifdef GDK_WINDOWING_WAYLAND
+    GdkWindow *window = GTKGetDrawingWindow();
+    int w = gdk_window_get_width(window);
+    int h = gdk_window_get_height(window);
+    struct wl_surface *surface = gdk_wayland_window_get_wl_surface(window);
+
+    m_wlSubsurface = wl_subcompositor_get_subsurface(m_wlSubcompositor,
+                                                     m_wlSurface,
+                                                     surface);
+    wl_subsurface_set_desync(m_wlSubsurface);
+    wxEGLUpdatePosition(this);
+    int scale = gdk_window_get_scale_factor(window);
+    wl_surface_set_buffer_scale(m_wlSurface, scale);
+    m_wlEGLWindow = wl_egl_window_create(m_wlSurface, w * scale,
+                                         h * scale);
+    m_surface = eglCreatePlatformWindowSurface(m_display, *m_config,
+                                               m_wlEGLWindow, nullptr);
+    m_wlFrameCallbackHandler = wl_surface_frame(surface);
+    wl_callback_add_listener(m_wlFrameCallbackHandler,
+                             &wl_frame_listener, this);
+
+    if ( m_surface == EGL_NO_SURFACE )
+    {
+        wxFAIL_MSG("Unable to create EGL surface");
+        return;
+    }
+#endif
+}
+
+void wxGLCanvasEGL::DestroyWaylandEGLWindow()
+{
+#ifdef GDK_WINDOWING_WAYLAND
+    if ( m_surface )
+    {
+        eglDestroySurface(m_display, m_surface);
+        m_surface = EGL_NO_SURFACE;
+    }
     g_clear_pointer(&m_wlEGLWindow, wl_egl_window_destroy);
     g_clear_pointer(&m_wlSubsurface, wl_subsurface_destroy);
-    g_clear_pointer(&m_wlSurface, wl_surface_destroy);
     g_clear_pointer(&m_wlFrameCallbackHandler, wl_callback_destroy);
+    m_readyToDraw = false;
 #endif
 }
 

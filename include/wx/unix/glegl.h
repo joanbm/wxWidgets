@@ -69,6 +69,11 @@ public:
 
     virtual ~wxGLCanvasEGL();
 
+    // Wayland-specific callbacks
+    // --------------------------
+
+    void CreateWaylandEGLWindow();
+    void DestroyWaylandEGLWindow();
 
     // implement wxGLCanvasBase methods
     // --------------------------------
