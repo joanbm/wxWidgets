@@ -449,6 +449,16 @@ static void gtk_glcanvas_unmap_callback(GtkWidget *, wxGLCanvasEGL *win)
     win->DestroyWaylandEGLWindow();
 }
 
+static void gtk_glcanvas_hierarchy_changed_callback(GtkWidget *self, GtkWidget *previous_toplevel, wxGLCanvasEGL *win)
+{
+    if ( GTK_IS_WINDOW(previous_toplevel) )
+        g_signal_handlers_disconnect_by_func (previous_toplevel, (gpointer)gtk_glcanvas_map_callback, win);
+
+    GtkWidget *new_toplevel = gtk_widget_get_toplevel(self);
+    if ( GTK_IS_WINDOW(new_toplevel) )
+        g_signal_connect(new_toplevel, "map", G_CALLBACK(gtk_glcanvas_map_callback), win);
+}
+
 static void gtk_glcanvas_size_callback(GtkWidget *widget,
                                        GtkAllocation *,
                                        wxGLCanvasEGL *win)
@@ -530,6 +540,22 @@ bool wxGLCanvasEGL::CreateSurface()
         g_signal_connect(m_widget, "size-allocate",
                          G_CALLBACK(gtk_glcanvas_size_callback), this);
 
+        // Due to a GTK/GDK oddity, when a toplevel window containing a canvas
+        // is shown, then hidden, then shown again, when we receive the "map"
+        // signal for the canvas, the wl_surface will not yet have been created
+        // (gdk_wayland_window_get_wl_surface returns nullptr). Instead, it is
+        // created when the toplevel window is mapped. So, listen for the "map"
+        // signal on the toplevel window to ensure we can create the surface
+        GtkWidget *toplevel = gtk_widget_get_toplevel(m_widget);
+        if ( GTK_IS_WINDOW(toplevel) )
+        {
+            g_signal_connect(toplevel, "map",
+                             G_CALLBACK(gtk_glcanvas_map_callback), this);
+        }
+        // Needed to re-associate the callback if the canvas is reparented to another window
+        g_signal_connect(m_widget, "hierarchy-changed",
+                         G_CALLBACK(gtk_glcanvas_hierarchy_changed_callback), this);
+
         // Ensure that eglSwapBuffers() doesn't block, as we use the surface
         // callback to know when we should draw ourselves already.
         eglSwapInterval(m_display, 0);
@@ -549,15 +575,39 @@ wxGLCanvasEGL::~wxGLCanvasEGL()
 #endif
     if ( m_surface )
         eglDestroySurface(m_display, m_surface);
+
+    GtkWidget *toplevel = gtk_widget_get_toplevel(m_widget);
+    if ( GTK_IS_WINDOW(toplevel) )
+        g_signal_handlers_disconnect_by_func (toplevel, (gpointer)gtk_glcanvas_map_callback, this);
 }
 
 void wxGLCanvasEGL::CreateWaylandEGLWindow()
 {
 #ifdef GDK_WINDOWING_WAYLAND
+    if ( m_surface != EGL_NO_SURFACE )
+    {
+        // Already created (can happen because we receive this callback
+        // for both the canvas, and the associated toplevel window)
+        return;
+    }
+    if ( !gtk_widget_get_mapped(m_widget) )
+    {
+        // We got a call because the toplevel window has been mapped but the
+        // canvas is not mapped (e.g. is hidden), so ignore it
+        return;
+    }
+
     GdkWindow *window = GTKGetDrawingWindow();
     int w = gdk_window_get_width(window);
     int h = gdk_window_get_height(window);
     struct wl_surface *surface = gdk_wayland_window_get_wl_surface(window);
+    if ( !surface )
+    {
+        // The canvas is mapped, but the wl_surface associated to the toplevel
+        // window has not yet been created. Exit, right after, we should get
+        // a map call for the toplevel window, with the wl_surface created
+        return;
+    }
 
     m_wlSubsurface = wl_subcompositor_get_subsurface(m_wlSubcompositor,
                                                      m_wlSurface,
